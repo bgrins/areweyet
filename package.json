@@ -1,0 +1,10 @@
+{
+  "name": "areweyet",
+  "version": "1.0.0",
+  "description": "",
+  "author": "",
+  "devDependencies": {
+    "node-fetch": "^2.6.0",
+    "puppeteer": "^2.0.0"
+  }
+}

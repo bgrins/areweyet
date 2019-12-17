@@ -1,0 +1,226 @@
+
+# HG changeset patch
+# User Emilio Cobos Álvarez <emilio@crisal.io>
+# Date 1573677315 0
+# Node ID b8a5f2a349bc8429c935dd0af40dbc360bead67c
+# Parent  0cc270168d0844f4e252575dfa04ad588c2f31c7
+Bug 1596199 - Devirtualize GetBindingParent. r=bzbarsky
+
+The amount of XUL elements with non-null binding-parent pointer should be
+equivalent to HTML now that XBL is gone.
+
+Shadow DOM already has the extended slots for both the binding parent and
+containing shadow root.
+
+Differential Revision: https://phabricator.services.mozilla.com/D52901
+
+diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
+--- a/dom/base/Element.cpp
++++ b/dom/base/Element.cpp
+@@ -1472,26 +1472,19 @@ nsresult Element::BindToTree(BindContext
+                  aContext.GetBindingParent() == &aParent,
+              "Native anonymous content must have its parent as its "
+              "own binding parent");
+   MOZ_ASSERT(aContext.GetBindingParent() || !aParent.IsContent() ||
+                  aContext.GetBindingParent() ==
+                      aParent.AsContent()->GetBindingParent(),
+              "We should be passed the right binding parent");
+ 
+-#ifdef MOZ_XUL
+   // First set the binding parent
+-  if (nsXULElement* xulElem = nsXULElement::FromNode(this)) {
+-    xulElem->SetXULBindingParent(aContext.GetBindingParent());
+-  } else
+-#endif
+-  {
+-    if (Element* bindingParent = aContext.GetBindingParent()) {
+-      ExtendedDOMSlots()->mBindingParent = bindingParent;
+-    }
++  if (Element* bindingParent = aContext.GetBindingParent()) {
++    ExtendedDOMSlots()->mBindingParent = bindingParent;
+   }
+ 
+   const bool hadParent = !!GetParentNode();
+ 
+   NS_ASSERTION(!aContext.GetBindingParent() ||
+                    IsRootOfNativeAnonymousSubtree() ||
+                    !HasFlag(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE) ||
+                    aParent.IsInNativeAnonymousSubtree(),
+@@ -1766,29 +1759,18 @@ void Element::UnbindFromTree(bool aNullP
+ 
+   if (aNullParent || !mParent->IsInShadowTree()) {
+     UnsetFlags(NODE_IS_IN_SHADOW_TREE);
+ 
+     // Begin keeping track of our subtree root.
+     SetSubtreeRootPointer(aNullParent ? this : mParent->SubtreeRoot());
+   }
+ 
+-  bool clearBindingParent = true;
+-
+-#ifdef MOZ_XUL
+-  if (nsXULElement* xulElem = nsXULElement::FromNode(this)) {
+-    xulElem->SetXULBindingParent(nullptr);
+-    clearBindingParent = false;
+-  }
+-#endif
+-
+   if (nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+-    if (clearBindingParent) {
+-      slots->mBindingParent = nullptr;
+-    }
++    slots->mBindingParent = nullptr;
+     if (aNullParent || !mParent->IsInShadowTree()) {
+       slots->mContainingShadow = nullptr;
+     }
+   }
+ 
+   if (document) {
+     // Disconnected must be enqueued whenever a connected custom element becomes
+     // disconnected.
+diff --git a/dom/base/nsIContent.h b/dom/base/nsIContent.h
+--- a/dom/base/nsIContent.h
++++ b/dom/base/nsIContent.h
+@@ -377,24 +377,24 @@ class nsIContent : public nsINode {
+    *         Because we don't process some native events, but they may be needed
+    *         by the plug-in.
+    */
+   virtual IMEState GetDesiredIMEState();
+ 
+   /**
+    * Gets content node with the binding (or native code, possibly on the
+    * frame) responsible for our construction (and existence).  Used by
+-   * anonymous content (both XBL-generated and native-anonymous).
++   * native-anonymous content and shadow DOM.
+    *
+    * null for all explicit content (i.e., content reachable from the top
+    * of its GetParent() chain via child lists).
+    *
+    * @return the binding parent
+    */
+-  virtual mozilla::dom::Element* GetBindingParent() const {
++  mozilla::dom::Element* GetBindingParent() const {
+     const nsExtendedContentSlots* slots = GetExistingExtendedContentSlots();
+     return slots ? slots->mBindingParent.get() : nullptr;
+   }
+ 
+   /**
+    * Gets the ShadowRoot binding for this element.
+    *
+    * @return The ShadowRoot currently bound to this element.
+diff --git a/dom/xul/nsXULElement.cpp b/dom/xul/nsXULElement.cpp
+--- a/dom/xul/nsXULElement.cpp
++++ b/dom/xul/nsXULElement.cpp
+@@ -98,17 +98,17 @@ uint32_t nsXULPrototypeAttribute::gNumCa
+ 
+ #define NS_DISPATCH_XUL_COMMAND (1 << 0)
+ 
+ //----------------------------------------------------------------------
+ // nsXULElement
+ //
+ 
+ nsXULElement::nsXULElement(already_AddRefed<mozilla::dom::NodeInfo>&& aNodeInfo)
+-    : nsStyledElement(std::move(aNodeInfo)), mBindingParent(nullptr) {
++    : nsStyledElement(std::move(aNodeInfo)) {
+   XUL_PROTOTYPE_ATTRIBUTE_METER(gNumElements);
+ }
+ 
+ nsXULElement::~nsXULElement() {}
+ 
+ void nsXULElement::MaybeUpdatePrivateLifetime() {
+   if (AttrValueIs(kNameSpaceID_None, nsGkAtoms::windowtype,
+                   NS_LITERAL_STRING("navigator:browser"), eCaseMatters)) {
+@@ -266,27 +266,17 @@ void NS_TrustedNewXULElement(
+ 
+   // Create an nsXULElement with the specified namespace and tag.
+   NS_ADDREF(*aResult = nsXULElement::Construct(ni.forget()));
+ }
+ 
+ //----------------------------------------------------------------------
+ // nsISupports interface
+ 
+-NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULElement)
+-
+-NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsXULElement, nsStyledElement)
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBindingParent);
+-NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+-
+-NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(nsXULElement, nsStyledElement)
+-  // Why aren't we unlinking the prototype?
+-  tmp->ClearHasID();
+-  NS_IMPL_CYCLE_COLLECTION_UNLINK(mBindingParent);
+-NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_INHERITED(nsXULElement, nsStyledElement)
+ 
+ NS_IMPL_ADDREF_INHERITED(nsXULElement, nsStyledElement)
+ NS_IMPL_RELEASE_INHERITED(nsXULElement, nsStyledElement)
+ 
+ NS_INTERFACE_TABLE_HEAD_CYCLE_COLLECTION_INHERITED(nsXULElement)
+   NS_ELEMENT_INTERFACE_TABLE_TO_MAP_SEGUE
+ NS_INTERFACE_MAP_END_INHERITING(nsStyledElement)
+ 
+diff --git a/dom/xul/nsXULElement.h b/dom/xul/nsXULElement.h
+--- a/dom/xul/nsXULElement.h
++++ b/dom/xul/nsXULElement.h
+@@ -344,38 +344,29 @@ class nsXULElement : public nsStyledElem
+ 
+   bool HasMenu();
+   MOZ_CAN_RUN_SCRIPT void OpenMenu(bool aOpenFlag);
+ 
+   virtual bool PerformAccesskey(bool aKeyCausesActivation,
+                                 bool aIsTrustedEvent) override;
+   void ClickWithInputSource(uint16_t aInputSource, bool aIsTrustedEvent);
+ 
+-  Element* GetBindingParent() const final { return mBindingParent; }
+-
+   virtual bool IsNodeOfType(uint32_t aFlags) const override;
+   virtual bool IsFocusableInternal(int32_t* aTabIndex,
+                                    bool aWithMouse) override;
+ 
+   virtual nsChangeHint GetAttributeChangeHint(const nsAtom* aAttribute,
+                                               int32_t aModType) const override;
+   NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
+ 
+   virtual nsresult Clone(mozilla::dom::NodeInfo*,
+                          nsINode** aResult) const override;
+ 
+   virtual void RecompileScriptEventListeners() override;
+ 
+-  // This function should ONLY be used by BindToTree implementations.
+-  // The function exists solely because XUL elements store the binding
+-  // parent as a member instead of in the slots, as Element does.
+-  void SetXULBindingParent(Element* aBindingParent) {
+-    mBindingParent = aBindingParent;
+-  }
+-
+   virtual bool IsEventAttributeNameInternal(nsAtom* aName) override;
+ 
+   typedef mozilla::dom::DOMString DOMString;
+   void GetXULAttr(nsAtom* aName, DOMString& aResult) const {
+     GetAttr(kNameSpaceID_None, aName, aResult);
+   }
+   void SetXULAttr(nsAtom* aName, const nsAString& aValue,
+                   mozilla::ErrorResult& aError) {
+@@ -528,22 +519,16 @@ class nsXULElement : public nsStyledElem
+   friend class nsNSElementTearoff;
+ 
+   // Implementation methods
+   nsresult EnsureContentsGenerated(void) const;
+ 
+   nsresult AddPopupListener(nsAtom* aName);
+ 
+   /**
+-   * The nearest enclosing content node with a binding
+-   * that created us.
+-   */
+-  RefPtr<Element> mBindingParent;
+-
+-  /**
+    * Abandon our prototype linkage, and copy all attributes locally
+    */
+   nsresult MakeHeavyweight(nsXULPrototypeElement* aPrototype);
+ 
+   virtual nsresult BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                  const nsAttrValueOrString* aValue,
+                                  bool aNotify) override;
+   virtual nsresult AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+
